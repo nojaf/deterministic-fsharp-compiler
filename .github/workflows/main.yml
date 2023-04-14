@@ -1,0 +1,17 @@
+name: Run F# script
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # runs every day at midnight
+  workflow_dispatch: # allows manual triggering of the workflow
+
+jobs:
+  run-script:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+      - name: Run F# script
+        run: dotnet fsi script.fsx
