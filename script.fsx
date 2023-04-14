@@ -236,6 +236,7 @@ let repositories =
             RemoveGlobalJson = true
             Init =
                 [
+                    Cli.Wrap(dotnetExe).WithArguments("tool restore")
                     // This will download the FCS files as well.
                     Cli.Wrap(dotnetExe).WithArguments("restore")
                     // Trigger the fslex/fsyacc build.
