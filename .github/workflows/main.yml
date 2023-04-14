@@ -11,7 +11,15 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
+      - name: Checkout fsharp main
+        uses: actions/checkout@v3
+        with:
+          repository: dotnet/fsharp
+          path: .fsharp
+          ref: main
       - name: Setup .NET
         uses: actions/setup-dotnet@v3
+        with:
+          global-json-file: .fsharp/global.json
       - name: Run F# script
         run: dotnet fsi script.fsx
