@@ -19,8 +19,8 @@ let repositoriesFolder = Path.Combine(__SOURCE_DIRECTORY__, ".repositories")
 
 let limits =
     {|
-        MaxSequentialRuns = 5
-        MaxParallelRuns = 20
+        MaxSequentialRuns = 2
+        MaxParallelRuns = 3
     |}
 
 let getFileHash filename =
@@ -199,6 +199,7 @@ type TypeCheckMode =
 
 type BinaryHash = BinaryHash of file: string * hash: string
 
+[<CustomEquality; NoComparison>]
 type CompilationResult =
     {
         Attempt: int
@@ -206,6 +207,23 @@ type CompilationResult =
         TypeCheckMode: TypeCheckMode
         BinaryHashes: BinaryHash list
     }
+
+    override x.Equals other =
+        match other with
+        | :? CompilationResult as other -> x.BinaryHashes = other.BinaryHashes
+        | _ -> false
+
+    override x.GetHashCode() =
+        let hash = HashCode()
+        hash.Add(x.BinaryHashes.GetHashCode())
+        hash.ToHashCode()
+
+/// Aim to shortcut the compilations of a project when the result has been unstable for a single instance.
+[<RequireQualifiedAccess>]
+type HistoricCompilationResult<'TResult when 'TResult: equality> =
+    | NeverRan
+    | Stable of result: 'TResult * times: int
+    | Unstable of initial: 'TResult * times: int * variant: 'TResult
 
 type ProjectResult = ProjectResult of projectName: string * compilationResults: CompilationResult array
 type RepositoryResult = RepositoryResult of repository: RepositoryConfiguration * projectResults: ProjectResult array
@@ -314,9 +332,23 @@ let testProject (repositoryFolder: DirectoryInfo) (project: ProjectInRepository)
                     |> List.map (fun idx -> fun () -> build repositoryFolder idx Parallel project)
             |]
 
+        let mutable currentResult = HistoricCompilationResult.NeverRan
+
         for idx in 0 .. results.Length - 1 do
-            let! result = runs.[idx] ()
-            results.[idx] <- result
+            match currentResult with
+            | HistoricCompilationResult.Unstable _ -> ()
+            | HistoricCompilationResult.NeverRan ->
+                let! result = runs.[idx] ()
+                results.[idx] <- result
+                currentResult <- HistoricCompilationResult.Stable(result, 1)
+            | HistoricCompilationResult.Stable(stableResult, times) ->
+                let! result = runs.[idx] ()
+                results.[idx] <- result
+
+                if result = stableResult then
+                    currentResult <- HistoricCompilationResult.Stable(result, times + 1)
+                else
+                    currentResult <- HistoricCompilationResult.Unstable(stableResult, times, result)
 
         printfn $"End testing project %s{project.Path}"
 
