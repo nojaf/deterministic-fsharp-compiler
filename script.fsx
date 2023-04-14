@@ -1,3 +1,4 @@
+#r "System.Security.Cryptography"
 #r "nuget: CliWrap, 3.6.0"
 #r "nuget: FSharp.Data, 6.1.1-beta"
 
@@ -8,11 +9,25 @@ open System.Runtime.InteropServices
 open System.Threading.Tasks
 open FSharp.Data
 open CliWrap
+open CliWrap.Buffered
 
+// 0. Setup and helper functions
 let isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
 let sdkFolder = Path.Combine(__SOURCE_DIRECTORY__, ".sdks")
 let fsharpFolder = Path.Combine(__SOURCE_DIRECTORY__, ".fsharp")
 let repositoriesFolder = Path.Combine(__SOURCE_DIRECTORY__, ".repositories")
+
+let limits =
+    {|
+        MaxSequentialRuns = 5
+        MaxParallelRuns = 20
+    |}
+
+let getFileHash filename =
+    use sha256 = System.Security.Cryptography.SHA256.Create()
+    use stream = File.OpenRead(filename)
+    let hash = sha256.ComputeHash(stream)
+    BitConverter.ToString(hash).Replace("-", "")
 
 // 1. Download dotnet 8 nightly
 let dotnetSDKDownloadUrl =
@@ -129,6 +144,19 @@ Cli
     .ExecuteAsync()
     .Task.Wait()
 
+// Capture information about the state of the compiler
+let gitInfo (args: string) =
+    Cli
+        .Wrap("git")
+        .WithWorkingDirectory(fsharpFolder)
+        .WithArguments(args)
+        .ExecuteBufferedAsync()
+        .Task.Result.StandardOutput.Trim()
+
+let fscCommit = gitInfo "rev-parse HEAD"
+let fscCommitDate = gitInfo "log -1 --format=%ai" |> DateTime.Parse
+let fscMessage = gitInfo "log -1 --format=%s"
+
 let DotnetFscCompilerPath =
     Path.Combine(fsharpFolder, "artifacts", "bin", "fsc", "Release", "net7.0", "win-x64", "fsc.dll")
 
@@ -169,11 +197,18 @@ type TypeCheckMode =
         | Sequential -> "sequential"
         | Parallel -> "parallel"
 
+type BinaryHash = BinaryHash of file: string * hash: string
+
 type CompilationResult =
     {
+        Attempt: int
         Duration: TimeSpan
         TypeCheckMode: TypeCheckMode
+        BinaryHashes: BinaryHash list
     }
+
+type ProjectResult = ProjectResult of projectName: string * compilationResults: CompilationResult array
+type RepositoryResult = RepositoryResult of repository: RepositoryConfiguration * projectResults: ProjectResult array
 
 let repositories =
     [
@@ -206,21 +241,97 @@ let repositories =
         }
     ]
 
-let limits =
-    {|
-        MaxSequentialRuns = 5
-        MaxParallelRuns = 20
-    |}
-
-let testRepository (repository: RepositoryConfiguration) =
+let build
+    (repositoryFolder: DirectoryInfo)
+    (idx: int)
+    (typeCheckMode: TypeCheckMode)
+    (project: ProjectInRepository)
+    : Task<CompilationResult> =
     task {
-        let projectFolder =
+        printfn $"Start building {project.Path} (%i{idx}) in %O{typeCheckMode} mode"
+
+        let outputFolder =
+            Path.Combine(
+                repositoryFolder.FullName,
+                ".results",
+                Path.GetFileNameWithoutExtension(project.Path),
+                $"%O{typeCheckMode}-%03i{idx}"
+            )
+
+        let! result =
+            Cli
+                .Wrap(dotnetExe)
+                .WithWorkingDirectory(repositoryFolder.FullName)
+                .WithArguments(
+                    [|
+                        "build"
+                        project.Path
+                        "-c Release"
+                        $"-o %s{outputFolder}"
+                        "--no-incremental"
+                        $"/p:DotnetFscCompilerPath=\"%s{DotnetFscCompilerPath}\""
+                        $"/p:OtherFlags=\"%s{typeCheckMode.Flags}\""
+                    |]
+                    |> String.concat " "
+                )
+                .WithStandardOutputPipe(PipeTarget.ToDelegate(printfn "%s"))
+                .ExecuteAsync()
+
+        let binaries =
+            project.OutputBinaries
+            |> List.map (fun binaryFileName ->
+                let binaryPath = Path.Combine(outputFolder, binaryFileName)
+
+                if not (File.Exists binaryPath) then
+                    failwithf $"Binary %s{binaryPath} not found after compiling %s{project.Path}"
+
+                BinaryHash(binaryFileName, getFileHash binaryPath)
+            )
+
+        return
+            {
+                Attempt = idx
+                Duration = result.RunTime
+                TypeCheckMode = typeCheckMode
+                BinaryHashes = binaries
+            }
+    }
+
+let testProject (repositoryFolder: DirectoryInfo) (project: ProjectInRepository) : Task<ProjectResult> =
+    task {
+        printfn $"Start testing project %s{project.Path}"
+
+        let results =
+            Array.zeroCreate<CompilationResult> (limits.MaxSequentialRuns + limits.MaxParallelRuns)
+
+        let runs =
+            [|
+                yield!
+                    [ 1 .. limits.MaxSequentialRuns ]
+                    |> List.map (fun idx -> fun () -> build repositoryFolder idx Sequential project)
+                yield!
+                    [ 1 .. limits.MaxParallelRuns ]
+                    |> List.map (fun idx -> fun () -> build repositoryFolder idx Parallel project)
+            |]
+
+        for idx in 0 .. results.Length - 1 do
+            let! result = runs.[idx] ()
+            results.[idx] <- result
+
+        printfn $"End testing project %s{project.Path}"
+
+        return ProjectResult(project.Path, results)
+    }
+
+let testRepository (repository: RepositoryConfiguration) : Task<RepositoryResult> =
+    task {
+        let repositoryFolder =
             DirectoryInfo(Path.Combine(repositoriesFolder, repository.RepositoryName))
 
         let git (arguments: string) =
             Cli
                 .Wrap("git")
-                .WithWorkingDirectory(projectFolder.FullName)
+                .WithWorkingDirectory(repositoryFolder.FullName)
                 .WithArguments(arguments)
                 .WithStandardOutputPipe(PipeTarget.ToDelegate(printfn "%s"))
                 .ExecuteAsync()
@@ -228,8 +339,8 @@ let testRepository (repository: RepositoryConfiguration) =
             :> Task
 
         // Clone the project if missing
-        if not projectFolder.Exists then
-            projectFolder.Create()
+        if not repositoryFolder.Exists then
+            repositoryFolder.Create()
             do! git "init"
             do! git $"remote add origin %s{repository.GitUrl}"
 
@@ -240,7 +351,7 @@ let testRepository (repository: RepositoryConfiguration) =
         printfn $"Preparing {repository.RepositoryName}"
 
         if repository.RemoveGlobalJson then
-            let globalJson = FileInfo(Path.Combine(projectFolder.FullName, "global.json"))
+            let globalJson = FileInfo(Path.Combine(repositoryFolder.FullName, "global.json"))
 
             if globalJson.Exists then
                 globalJson.Delete()
@@ -249,79 +360,63 @@ let testRepository (repository: RepositoryConfiguration) =
         for cmd in repository.Init do
             do!
                 cmd
-                    .WithWorkingDirectory(projectFolder.FullName)
+                    .WithWorkingDirectory(repositoryFolder.FullName)
                     .WithStandardOutputPipe(PipeTarget.ToDelegate(printfn "%s"))
                     .ExecuteAsync()
                     .Task
                 :> Task
 
-        let resultsFolder = DirectoryInfo(Path.Combine(projectFolder.FullName, ".results"))
+        let resultsFolder =
+            DirectoryInfo(Path.Combine(repositoryFolder.FullName, ".results"))
         // Always clean the results folder
         if resultsFolder.Exists then
             resultsFolder.Delete(true)
 
         resultsFolder.Create()
 
-        let results =
-            let projectLength = List.length repository.Projects
+        let projectResults = Array.zeroCreate<ProjectResult> repository.Projects.Length
 
-            ResizeArray<CompilationResult>(
-                projectLength * limits.MaxSequentialRuns
-                + projectLength * limits.MaxParallelRuns
-            )
+        for idx = 0 to repository.Projects.Length - 1 do
+            let project = repository.Projects.[idx]
+            let! result = testProject repositoryFolder project
+            projectResults.[idx] <- result
 
-        let build idx (typeCheckMode: TypeCheckMode) project =
-            task {
-                let outputFolder =
-                    Path.Combine(
-                        projectFolder.FullName,
-                        ".results",
-                        Path.GetFileNameWithoutExtension(project.Path),
-                        $"%O{typeCheckMode}-%03i{idx}"
-                    )
-
-                let! result =
-                    Cli
-                        .Wrap(dotnetExe)
-                        .WithWorkingDirectory(projectFolder.FullName)
-                        .WithArguments(
-                            [|
-                                "build"
-                                project.Path
-                                "-c Release"
-                                $"-o %s{outputFolder}"
-                                "--no-incremental"
-                                $"/p:DotnetFscCompilerPath=\"%s{DotnetFscCompilerPath}\""
-                                $"/p:OtherFlags=\"%s{typeCheckMode.Flags}\""
-                            |]
-                            |> String.concat " "
-                        )
-                        .WithStandardOutputPipe(PipeTarget.ToDelegate(printfn "%s"))
-                        .ExecuteAsync()
-
-                return
-                    {
-                        Duration = result.RunTime
-                        TypeCheckMode = typeCheckMode
-                    }
-            }
-
-        for project in repository.Projects do
-            for idx in [ 1 .. limits.MaxSequentialRuns ] do
-                let! result = build idx Sequential project
-                results.Add result
-
-            for idx in [ 1 .. limits.MaxParallelRuns ] do
-                let! result = build idx Parallel project
-                results.Add result
-
-        return Seq.toArray results
+        return RepositoryResult(repository, projectResults)
     }
 
 let results =
     repositories
     |> List.map (fun repository ->
         // I'm ok with this running synchronously, as it's just a test.
-        let results = (testRepository repository).Result
-        repository, results
+        (testRepository repository).Result
     )
+
+let allBinariesHaveTheSameHash =
+    results
+    |> List.forall (fun (RepositoryResult(projectResults = results)) ->
+        results
+        |> Array.forall (fun (ProjectResult(compilationResults = results)) ->
+            results
+            |> Array.forall (fun result ->
+                let grouped =
+                    result.BinaryHashes
+                    |> List.groupBy (fun (BinaryHash(file = file)) -> file)
+                    |> List.map (fun (file, hashes) ->
+                        file, (hashes |> List.map (fun (BinaryHash(hash = hash)) -> hash) |> List.distinct)
+                    )
+
+                grouped
+                |> List.forall (fun (file, hashes) ->
+                    if hashes.Length <> 1 then
+                        let hashes = String.concat ", " hashes
+                        printfn $"File %s{file} has different hashes: %s{hashes}"
+                        false
+                    else
+                        true
+                )
+            )
+        )
+    )
+
+if not allBinariesHaveTheSameHash then
+    exit 1
