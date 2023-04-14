@@ -232,12 +232,13 @@ let repositories =
     [
         {
             GitUrl = "https://github.com/fsprojects/fantomas"
-            CommitSha = "1655281cea0d5e4680d953b9f160735b0d2a6f7f"
+            CommitSha = "d3f2daa02eccf6fb0fbcd1bfeeaccfd252a67700"
             RemoveGlobalJson = true
             Init =
                 [
-                    Cli.Wrap(dotnetExe).WithArguments("tool restore")
-                    // This will download the FCS files as well.
+                    // This will download the FCS files.
+                    Cli.Wrap(dotnetExe).WithArguments("fsi ./build.fsx -p Init")
+                    // Restore the nuget packages.
                     Cli.Wrap(dotnetExe).WithArguments("restore")
                     // Trigger the fslex/fsyacc build.
                     Cli
