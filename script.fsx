@@ -1,6 +1,7 @@
 #r "System.Security.Cryptography"
 #r "nuget: CliWrap, 3.6.0"
 #r "nuget: FSharp.Data, 6.1.1-beta"
+#r "nuget: MSBuild.StructuredLogger, 2.1.790"
 
 open System
 open System.IO
@@ -19,9 +20,12 @@ let repositoriesFolder = Path.Combine(__SOURCE_DIRECTORY__, ".repositories")
 
 let limits =
     {|
-        MaxSequentialRuns = 2
-        MaxParallelRuns = 3
+        MaxSequentialRuns = 5
+        MaxParallelRuns = 20
     |}
+
+// Roll forward so we can call with using the dotnet 8 SDK.
+Environment.SetEnvironmentVariable("RollForward", "Major")
 
 let getFileHash filename =
     use sha256 = System.Security.Cryptography.SHA256.Create()
@@ -135,8 +139,6 @@ Cli
             // No Proto build
             "/p:BUILDING_USING_DOTNET=true"
             "/p:ErrorOnDuplicatePublishOutputFiles=False"
-            // Roll forward so we can call with using the dotnet 8 SDK.
-            "/p:RollForward=Major"
         |]
         |> String.concat " "
     )
@@ -166,10 +168,10 @@ if not (Directory.Exists repositoriesFolder) then
 
 type ProjectInRepository =
     {
-        /// Relative path to the project file
+        /// Relative path to the project file.
         Path: string
-        /// Names of the binaries we want to include in our determinism test
-        OutputBinaries: string list
+        // Additional argument to pass to the initial build.
+        AdditionalInitialBuildArguments: string list
     }
 
 type RepositoryConfiguration =
@@ -205,17 +207,20 @@ type CompilationResult =
         Attempt: int
         Duration: TimeSpan
         TypeCheckMode: TypeCheckMode
-        BinaryHashes: BinaryHash list
+        BinaryHash: BinaryHash
     }
 
     override x.Equals other =
         match other with
-        | :? CompilationResult as other -> x.BinaryHashes = other.BinaryHashes
+        | :? CompilationResult as other ->
+            let (BinaryHash(hash = xHash)) = x.BinaryHash
+            let (BinaryHash(hash = otherHash)) = other.BinaryHash
+            xHash = otherHash
         | _ -> false
 
     override x.GetHashCode() =
         let hash = HashCode()
-        hash.Add(x.BinaryHashes.GetHashCode())
+        hash.Add(x.BinaryHash)
         hash.ToHashCode()
 
 /// Aim to shortcut the compilations of a project when the result has been unstable for a single instance.
@@ -248,18 +253,117 @@ let repositories =
             Projects =
                 [
                     {
-                        Path = "src/Fantomas/Fantomas.fsproj"
-                        OutputBinaries =
-                            [
-                                "Fantomas.Client.dll"
-                                "Fantomas.FCS.dll"
-                                "Fantomas.Core.dll"
-                                "Fantomas.dll"
-                            ]
+                        Path = "src/Fantomas.Core/Fantomas.Core.fsproj"
+                        AdditionalInitialBuildArguments = []
+                    }
+                    {
+                        Path = "src/Fantomas.Core.Tests/Fantomas.Core.Tests.fsproj"
+                        AdditionalInitialBuildArguments = []
+                    }
+                ]
+        }
+        {
+            GitUrl = "https://github.com/dotnet/fsharp"
+            CommitSha = "fe4fda6e2a775c9e664af8949d1ecff608e4691b"
+            RemoveGlobalJson = true
+            Init = [ Cli.Wrap(dotnetExe).WithArguments("build FSharp.Compiler.Service.sln") ]
+            Projects =
+                [
+                    {
+                        Path = "src/FSharp.Core/FSharp.Core.fsproj"
+                        AdditionalInitialBuildArguments = [ "/p:BUILDING_USING_DOTNET=true" ]
+                    }
+                    {
+                        Path = "src/Compiler/FSharp.Compiler.Service.fsproj"
+                        AdditionalInitialBuildArguments = [ "/p:BUILDING_USING_DOTNET=true" ]
                     }
                 ]
         }
     ]
+
+/// Create a text file with the F# compiler arguments scrapped from an binary log file.
+let mkCompilerArgsFromBinLog file =
+    let build = Microsoft.Build.Logging.StructuredLogger.BinaryLog.ReadBuild file
+
+    let projectName =
+        build.Children
+        |> Seq.choose (
+            function
+            | :? Microsoft.Build.Logging.StructuredLogger.Project as p -> Some p.Name
+            | _ -> None
+        )
+        |> Seq.distinct
+        |> Seq.exactlyOne
+
+    let message (fscTask: Microsoft.Build.Logging.StructuredLogger.FscTask) =
+        fscTask.Children
+        |> Seq.tryPick (
+            function
+            | :? Microsoft.Build.Logging.StructuredLogger.Message as m when m.Text.Contains "fsc" -> Some m.Text
+            | _ -> None
+        )
+
+    let mutable args = None
+
+    build.VisitAllChildren<Microsoft.Build.Logging.StructuredLogger.Task>(fun task ->
+        match task with
+        | :? Microsoft.Build.Logging.StructuredLogger.FscTask as fscTask ->
+            match fscTask.Parent.Parent with
+            | :? Microsoft.Build.Logging.StructuredLogger.Project as p when p.Name = projectName ->
+                args <- message fscTask
+            | _ -> ()
+        | _ -> ()
+    )
+
+    match args with
+    | None -> failwithf $"Could not read the fsc arguments from %s{file}"
+    | Some args -> args
+
+/// Build the project first the first time to extract the fsc argument list.
+let initialBuild (repositoryFolder: DirectoryInfo) (project: ProjectInRepository) : Task =
+    task {
+        printfn $"Building %s{project.Path} to extract the fsc arguments."
+        let projectFile = Path.Combine(repositoryFolder.FullName, project.Path)
+        let binlogFile = Path.ChangeExtension(projectFile, ".binlog")
+        let argsPath = Path.ChangeExtension(binlogFile, ".rsp")
+
+        if not (File.Exists argsPath) then
+            let! result =
+                Cli
+                    .Wrap(dotnetExe)
+                    .WithWorkingDirectory(repositoryFolder.FullName)
+                    .WithArguments(
+                        [|
+                            "build"
+                            project.Path
+                            "-c Release"
+                            "--no-incremental"
+                            $"/p:DotnetFscCompilerPath=\"%s{DotnetFscCompilerPath}\""
+                            $"-bl:\"%s{binlogFile}\""
+                            yield! project.AdditionalInitialBuildArguments
+                        |]
+                        |> String.concat " "
+                    )
+                    .WithStandardOutputPipe(PipeTarget.ToDelegate(printfn "%s"))
+                    .ExecuteAsync()
+                    .Task
+
+            if result.ExitCode <> 0 then
+                printfn $"Could build {project.Path} to extract the fsc arguments."
+
+            let fscArgs = mkCompilerArgsFromBinLog binlogFile
+
+            let fscArgs =
+                fscArgs.Split([| ' '; '\n' |])
+                // Skip the dotnet.exe fsc.dll arguments.
+                |> Array.skip 2
+                |> String.concat "\n"
+
+            File.WriteAllText(argsPath, fscArgs)
+
+            return ()
+    }
+    :> Task
 
 let build
     (repositoryFolder: DirectoryInfo)
@@ -277,43 +381,50 @@ let build
                 Path.GetFileNameWithoutExtension(project.Path),
                 $"%O{typeCheckMode}-%03i{idx}"
             )
+            |> DirectoryInfo
+
+        if not outputFolder.Exists then
+            outputFolder.Create()
+
+        let rspFile =
+            Path.ChangeExtension(Path.Combine(repositoryFolder.FullName, project.Path), ".rsp")
+            |> Path.GetFullPath
+            |> FileInfo
+
+        if not rspFile.Exists then
+            failwithf $"Expected args file %s{rspFile.Name} to exist."
+
+        let outputFilePath =
+            let fscArgs = File.ReadAllLines rspFile.FullName
+            let outputArg = fscArgs |> Array.find (fun arg -> arg.StartsWith "-o:")
+            // Most likely a relative path
+            let file = outputArg.Replace("-o:", "")
+            Path.Combine(rspFile.Directory.FullName, file)
 
         let! result =
             Cli
                 .Wrap(dotnetExe)
-                .WithWorkingDirectory(repositoryFolder.FullName)
+                .WithWorkingDirectory(rspFile.Directory.FullName)
                 .WithArguments(
-                    [|
-                        "build"
-                        project.Path
-                        "-c Release"
-                        $"-o %s{outputFolder}"
-                        "--no-incremental"
-                        $"/p:DotnetFscCompilerPath=\"%s{DotnetFscCompilerPath}\""
-                        $"/p:OtherFlags=\"%s{typeCheckMode.Flags}\""
-                    |]
+                    [| DotnetFscCompilerPath; $"\"@{rspFile}\""; typeCheckMode.Flags |]
                     |> String.concat " "
                 )
                 .WithStandardOutputPipe(PipeTarget.ToDelegate(printfn "%s"))
                 .ExecuteAsync()
 
-        let binaries =
-            project.OutputBinaries
-            |> List.map (fun binaryFileName ->
-                let binaryPath = Path.Combine(outputFolder, binaryFileName)
+        let binaryHash =
+            let copiedBinaryFileName =
+                Path.Combine(outputFolder.FullName, Path.GetFileName(outputFilePath))
 
-                if not (File.Exists binaryPath) then
-                    failwithf $"Binary %s{binaryPath} not found after compiling %s{project.Path}"
-
-                BinaryHash(binaryFileName, getFileHash binaryPath)
-            )
+            File.Copy(outputFilePath, copiedBinaryFileName, true)
+            BinaryHash(copiedBinaryFileName, getFileHash outputFilePath)
 
         return
             {
                 Attempt = idx
                 Duration = result.RunTime
                 TypeCheckMode = typeCheckMode
-                BinaryHashes = binaries
+                BinaryHash = binaryHash
             }
     }
 
@@ -322,7 +433,10 @@ let testProject (repositoryFolder: DirectoryInfo) (project: ProjectInRepository)
         printfn $"Start testing project %s{project.Path}"
 
         let results =
-            Array.zeroCreate<CompilationResult> (limits.MaxSequentialRuns + limits.MaxParallelRuns)
+            Array.init<CompilationResult option> (limits.MaxSequentialRuns + limits.MaxParallelRuns) (fun _ -> None)
+
+        // Run the initial build to extract the fsc arguments.
+        do! initialBuild repositoryFolder project
 
         let runs =
             [|
@@ -337,23 +451,26 @@ let testProject (repositoryFolder: DirectoryInfo) (project: ProjectInRepository)
         let mutable currentResult = HistoricCompilationResult.NeverRan
 
         for idx in 0 .. results.Length - 1 do
-            match currentResult with
-            | HistoricCompilationResult.Unstable _ -> ()
-            | HistoricCompilationResult.NeverRan ->
-                let! result = runs.[idx] ()
-                results.[idx] <- result
-                currentResult <- HistoricCompilationResult.Stable(result, 1)
-            | HistoricCompilationResult.Stable(stableResult, times) ->
-                let! result = runs.[idx] ()
-                results.[idx] <- result
+            try
+                match currentResult with
+                | HistoricCompilationResult.Unstable _ -> ()
+                | HistoricCompilationResult.NeverRan ->
+                    let! result = runs.[idx] ()
+                    results.[idx] <- Some result
+                    currentResult <- HistoricCompilationResult.Stable(result, 1)
+                | HistoricCompilationResult.Stable(stableResult, times) ->
+                    let! result = runs.[idx] ()
+                    results.[idx] <- Some result
 
-                if result = stableResult then
-                    currentResult <- HistoricCompilationResult.Stable(result, times + 1)
-                else
-                    currentResult <- HistoricCompilationResult.Unstable(stableResult, times, result)
+                    if result = stableResult then
+                        currentResult <- HistoricCompilationResult.Stable(result, times + 1)
+                    else
+                        currentResult <- HistoricCompilationResult.Unstable(stableResult, times, result)
+            with ex ->
+                printfn $"Failed to compile %s{project.Path} (%i{idx}): %A{ex}"
 
         printfn $"End testing project %s{project.Path}"
-
+        let results = Array.choose id results
         return ProjectResult(project.Path, results)
     }
 
@@ -377,10 +494,10 @@ let testRepository (repository: RepositoryConfiguration) : Task<RepositoryResult
             repositoryFolder.Create()
             do! git "init"
             do! git $"remote add origin %s{repository.GitUrl}"
+            do! git "fetch origin"
+            do! git $"reset --hard %s{repository.CommitSha}"
 
-        do! git "fetch origin"
-        do! git $"reset --hard %s{repository.CommitSha}"
-        do! git $"clean -xdf"
+        // do! git $"clean -xdf"
 
         printfn $"Preparing {repository.RepositoryName}"
 
@@ -425,30 +542,27 @@ let results =
         (testRepository repository).Result
     )
 
+printfn $"Tested dotnet/fsharp@{fscCommit} {fscCommitDate} \"{fscMessage}\""
+
 let allBinariesHaveTheSameHash =
     results
-    |> List.forall (fun (RepositoryResult(projectResults = results)) ->
-        results
-        |> Array.forall (fun (ProjectResult(compilationResults = results)) ->
-            results
-            |> Array.forall (fun result ->
-                let grouped =
-                    result.BinaryHashes
-                    |> List.groupBy (fun (BinaryHash(file = file)) -> file)
-                    |> List.map (fun (file, hashes) ->
-                        file, (hashes |> List.map (fun (BinaryHash(hash = hash)) -> hash) |> List.distinct)
-                    )
-
-                grouped
-                |> List.forall (fun (file, hashes) ->
-                    if hashes.Length <> 1 then
-                        let hashes = String.concat ", " hashes
-                        printfn $"File %s{file} has different hashes: %s{hashes}"
-                        false
-                    else
-                        true
+    |> List.forall (fun (RepositoryResult(projectResults = projectResults)) ->
+        projectResults
+        |> Array.forall (fun (ProjectResult(projectName, compilationResults)) ->
+            let groups =
+                compilationResults
+                |> Array.groupBy (fun projectCompilationResult ->
+                    let (BinaryHash(hash = hashValue)) = projectCompilationResult.BinaryHash
+                    hashValue
                 )
-            )
+
+            if groups.Length <> 1 then
+                let hashes = groups |> Seq.map fst |> String.concat ", "
+
+                printfn $"File %s{projectName} has different hashes: %s{hashes}"
+                false
+            else
+                true
         )
     )
 
