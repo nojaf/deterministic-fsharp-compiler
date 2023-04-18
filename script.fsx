@@ -10,7 +10,6 @@ open System.Runtime.InteropServices
 open System.Threading.Tasks
 open FSharp.Data
 open CliWrap
-open CliWrap.Buffered
 
 // 0. Setup and helper functions
 let isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
@@ -21,10 +20,10 @@ let repositoriesFolder = Path.Combine(__SOURCE_DIRECTORY__, ".repositories")
 let limits =
     {|
         MaxSequentialRuns = 5
-        MaxParallelRuns = 20
+        MaxParallelRuns = 10
     |}
 
-// Roll forward so we can call with using the dotnet 8 SDK.
+// Roll forward so we can call with using the dotnet 7.0.4xx or 8.0.1xx SDK.
 Environment.SetEnvironmentVariable("RollForward", "Major")
 
 let getFileHash filename =
@@ -33,11 +32,11 @@ let getFileHash filename =
     let hash = sha256.ComputeHash(stream)
     BitConverter.ToString(hash).Replace("-", "")
 
-// 1. Download dotnet 8 nightly
+// 1. Download dotnet 7.0.4xx nightly
 let dotnetSDKDownloadUrl =
     if isWindows then
         // execute code only on Windows
-        "https://aka.ms/dotnet/8.0.1xx/daily/dotnet-sdk-win-x64.zip"
+        "https://aka.ms/dotnet/7.0.4xx/daily/dotnet-sdk-win-x64.zip"
     else
         failwith "Unsupported OS, feel free to add your own OS"
 
@@ -82,85 +81,14 @@ else
 let dotnetExe =
     Path.Combine(currentVersionPath, (if isWindows then "dotnet.exe" else "dotnet"))
 
-// 2. Compile the latest F# compiler, this is a temporary step as we hope it is in the SDK soon.
-if Directory.Exists fsharpFolder then
-    printfn "Update the F# compiler to the latest commit"
-
-    Cli
-        .Wrap("git")
-        .WithWorkingDirectory(fsharpFolder)
-        .WithArguments("checkout .")
-        .WithStandardOutputPipe(PipeTarget.ToDelegate(printfn "%s"))
-        .ExecuteAsync()
-        .Task.Wait()
-
-    Cli
-        .Wrap("git")
-        .WithWorkingDirectory(fsharpFolder)
-        .WithArguments("pull")
-        .WithStandardOutputPipe(PipeTarget.ToDelegate(printfn "%s"))
-        .ExecuteAsync()
-        .Task.Wait()
-else
-    printfn "Cloning the F# compiler"
-
-    Cli
-        .Wrap("git")
-        .WithWorkingDirectory(__SOURCE_DIRECTORY__)
-        .WithArguments($"clone https://github.com/dotnet/fsharp --single-branch {fsharpFolder}")
-        .WithStandardOutputPipe(PipeTarget.ToDelegate(printfn "%s"))
-        .ExecuteAsync()
-        .Task.Wait()
-
-// Compile the F# compiler
-// This script assumes the dotnet SDK the compiler needs in present
-// Build the FSC first
-Cli
-    .Wrap("dotnet")
-    .WithWorkingDirectory(fsharpFolder)
-    .WithArguments("build -c Release FSharp.Compiler.Service.sln")
-    .WithStandardOutputPipe(PipeTarget.ToDelegate(printfn "%s"))
-    .ExecuteAsync()
-    .Task.Wait()
-
-// Build the fsc.exe, note that this is current Windows only
-Cli
-    .Wrap("dotnet")
-    .WithWorkingDirectory(fsharpFolder)
-    .WithArguments(
-        [|
-            "build"
-            "./src/fsc/fscProject/fsc.fsproj"
-            "-c Release"
-            "-f net7.0"
-            "-r win-x64"
-            "-p:PublishReadyToRun=true"
-            "--no-self-contained"
-            // No Proto build
-            "/p:BUILDING_USING_DOTNET=true"
-            "/p:ErrorOnDuplicatePublishOutputFiles=False"
-        |]
-        |> String.concat " "
-    )
-    .WithStandardOutputPipe(PipeTarget.ToDelegate(printfn "%s"))
-    .ExecuteAsync()
-    .Task.Wait()
-
-// Capture information about the state of the compiler
-let gitInfo (args: string) =
-    Cli
-        .Wrap("git")
-        .WithWorkingDirectory(fsharpFolder)
-        .WithArguments(args)
-        .ExecuteBufferedAsync()
-        .Task.Result.StandardOutput.Trim()
-
-let fscCommit = gitInfo "rev-parse HEAD"
-let fscCommitDate = gitInfo "log -1 --format=%ai" |> DateTime.Parse
-let fscMessage = gitInfo "log -1 --format=%s"
+Environment.SetEnvironmentVariable("DOTNET_ROOT", currentVersionPath)
+Environment.SetEnvironmentVariable("SuppressNETCoreSdkPreviewMessage", "true")
 
 let DotnetFscCompilerPath =
-    Path.Combine(fsharpFolder, "artifacts", "bin", "fsc", "Release", "net7.0", "win-x64", "fsc.dll")
+    Directory.EnumerateFiles(currentVersionPath, "fsc.dll", SearchOption.AllDirectories)
+    |> Seq.exactlyOne
+
+// TODO: Capture information about the state of the compiler
 
 // 3. Clone various projects to test
 if not (Directory.Exists repositoriesFolder) then
@@ -338,7 +266,6 @@ let initialBuild (repositoryFolder: DirectoryInfo) (project: ProjectInRepository
                             project.Path
                             "-c Release"
                             "--no-incremental"
-                            $"/p:DotnetFscCompilerPath=\"%s{DotnetFscCompilerPath}\""
                             $"-bl:\"%s{binlogFile}\""
                             yield! project.AdditionalInitialBuildArguments
                         |]
@@ -498,7 +425,6 @@ let testRepository (repository: RepositoryConfiguration) : Task<RepositoryResult
             do! git $"reset --hard %s{repository.CommitSha}"
 
         // do! git $"clean -xdf"
-
         printfn $"Preparing {repository.RepositoryName}"
 
         if repository.RemoveGlobalJson then
@@ -541,8 +467,6 @@ let results =
         // I'm ok with this running synchronously, as it's just a test.
         (testRepository repository).Result
     )
-
-printfn $"Tested dotnet/fsharp@{fscCommit} {fscCommitDate} \"{fscMessage}\""
 
 let allBinariesHaveTheSameHash =
     results

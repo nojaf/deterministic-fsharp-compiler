@@ -4,22 +4,26 @@ on:
   schedule:
     - cron: '0 0 * * *' # runs every day at midnight
   workflow_dispatch: # allows manual triggering of the workflow
+  push:
+    branches:
+      - main
 
 jobs:
   run-script:
     runs-on: windows-latest
     steps:
+      - name: Enable long paths
+        run: |
+          git config --system core.longpaths true
+          echo "export GIT_OPTIONAL_LOCKS=0" >> $GITHUB_ENV
       - name: Checkout code
         uses: actions/checkout@v3
-      - name: Checkout fsharp main
-        uses: actions/checkout@v3
-        with:
-          repository: dotnet/fsharp
-          path: .fsharp
-          ref: main
       - name: Setup .NET
         uses: actions/setup-dotnet@v3
         with:
-          global-json-file: .fsharp/global.json
+          dotnet-version: 7.0.400
+          dotnet-quality: 'daily'
+      - name: Version
+        run: dotnet --version
       - name: Run F# script
         run: dotnet fsi script.fsx
