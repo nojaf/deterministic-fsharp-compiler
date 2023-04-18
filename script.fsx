@@ -5,10 +5,8 @@
 
 open System
 open System.IO
-open System.IO.Compression
 open System.Runtime.InteropServices
 open System.Threading.Tasks
-open FSharp.Data
 open CliWrap
 
 // 0. Setup and helper functions
@@ -20,7 +18,7 @@ let repositoriesFolder = Path.Combine(__SOURCE_DIRECTORY__, ".repositories")
 let limits =
     {|
         MaxSequentialRuns = 5
-        MaxParallelRuns = 10
+        MaxParallelRuns = 15
     |}
 
 // Roll forward so we can call with using the dotnet 7.0.4xx or 8.0.1xx SDK.
@@ -31,62 +29,11 @@ let getFileHash filename =
     use stream = File.OpenRead(filename)
     let hash = sha256.ComputeHash(stream)
     BitConverter.ToString(hash).Replace("-", "")
+// TODO: get SDK path
 
-// 1. Download dotnet 7.0.4xx nightly
-let dotnetSDKDownloadUrl =
-    if isWindows then
-        // execute code only on Windows
-        "https://aka.ms/dotnet/7.0.4xx/daily/dotnet-sdk-win-x64.zip"
-    else
-        failwith "Unsupported OS, feel free to add your own OS"
-
-let currentVersion =
-    let response = Http.Request(dotnetSDKDownloadUrl, httpMethod = "HEAD")
-
-    Uri(response.ResponseUrl).Segments
-    |> Seq.last
-    |> Path.GetFileNameWithoutExtension
-
-let currentVersionPath = Path.Combine(sdkFolder, currentVersion)
-
-if Directory.Exists currentVersionPath then
-    printfn $"SDK version %s{currentVersion} already exists"
-else
-    let extractDir = Directory.CreateDirectory(currentVersionPath)
-    printfn $"About to download SDK version %s{currentVersion}"
-    let response = Http.Request dotnetSDKDownloadUrl
-
-    match response.Body with
-    | Text txt -> failwithf $"Unexpected text response: %s{txt}"
-    | Binary bytes ->
-        if isWindows then
-            // create a memory stream from the zip bytes
-            use zipStream = new MemoryStream(bytes)
-            use zipArchive = new ZipArchive(zipStream)
-
-            for entry in zipArchive.Entries do
-                let outputPath = Path.Combine(extractDir.FullName, entry.FullName)
-
-                if not (Directory.Exists(Path.GetDirectoryName(outputPath))) then
-                    Directory.CreateDirectory(Path.GetDirectoryName(outputPath)) |> ignore
-
-                if entry.Length = 0L then
-                    // Create an empty directory
-                    Directory.CreateDirectory(outputPath) |> ignore
-                else
-                    use entryStream = entry.Open()
-                    use outputStream = File.Create(outputPath)
-                    entryStream.CopyTo(outputStream)
-
-let dotnetExe =
-    Path.Combine(currentVersionPath, (if isWindows then "dotnet.exe" else "dotnet"))
-
-Environment.SetEnvironmentVariable("DOTNET_ROOT", currentVersionPath)
 Environment.SetEnvironmentVariable("SuppressNETCoreSdkPreviewMessage", "true")
 
-let DotnetFscCompilerPath =
-    Directory.EnumerateFiles(currentVersionPath, "fsc.dll", SearchOption.AllDirectories)
-    |> Seq.exactlyOne
+let DotnetFscCompilerPath = Path.Combine(AppContext.BaseDirectory, "fsc.dll")
 
 // TODO: Capture information about the state of the compiler
 
@@ -170,13 +117,11 @@ let repositories =
             Init =
                 [
                     // This will download the FCS files.
-                    Cli.Wrap(dotnetExe).WithArguments("fsi ./build.fsx -p Init")
+                    Cli.Wrap("dotnet").WithArguments("fsi ./build.fsx -p Init")
                     // Restore the nuget packages.
-                    Cli.Wrap(dotnetExe).WithArguments("restore")
+                    Cli.Wrap("dotnet").WithArguments("restore")
                     // Trigger the fslex/fsyacc build.
-                    Cli
-                        .Wrap(dotnetExe)
-                        .WithArguments("build ./src/Fantomas.FCS/Fantomas.FCS.fsproj")
+                    Cli.Wrap("dotnet").WithArguments("build ./src/Fantomas.FCS/Fantomas.FCS.fsproj")
                 ]
             Projects =
                 [
@@ -194,7 +139,7 @@ let repositories =
             GitUrl = "https://github.com/dotnet/fsharp"
             CommitSha = "fe4fda6e2a775c9e664af8949d1ecff608e4691b"
             RemoveGlobalJson = true
-            Init = [ Cli.Wrap(dotnetExe).WithArguments("build FSharp.Compiler.Service.sln") ]
+            Init = [ Cli.Wrap("dotnet").WithArguments("build FSharp.Compiler.Service.sln") ]
             Projects =
                 [
                     {
@@ -258,7 +203,7 @@ let initialBuild (repositoryFolder: DirectoryInfo) (project: ProjectInRepository
         if not (File.Exists argsPath) then
             let! result =
                 Cli
-                    .Wrap(dotnetExe)
+                    .Wrap("dotnet")
                     .WithWorkingDirectory(repositoryFolder.FullName)
                     .WithArguments(
                         [|
@@ -330,13 +275,18 @@ let build
 
         let! result =
             Cli
-                .Wrap(dotnetExe)
+                .Wrap("dotnet")
                 .WithWorkingDirectory(rspFile.Directory.FullName)
                 .WithArguments(
-                    [| DotnetFscCompilerPath; $"\"@{rspFile}\""; typeCheckMode.Flags |]
+                    [|
+                        $"\"%s{DotnetFscCompilerPath}\""
+                        $"\"@%s{rspFile.Name}\""
+                        typeCheckMode.Flags
+                    |]
                     |> String.concat " "
                 )
                 .WithStandardOutputPipe(PipeTarget.ToDelegate(printfn "%s"))
+                .WithStandardErrorPipe(PipeTarget.ToDelegate(printfn "%s"))
                 .ExecuteAsync()
 
         let binaryHash =
@@ -412,6 +362,7 @@ let testRepository (repository: RepositoryConfiguration) : Task<RepositoryResult
                 .WithWorkingDirectory(repositoryFolder.FullName)
                 .WithArguments(arguments)
                 .WithStandardOutputPipe(PipeTarget.ToDelegate(printfn "%s"))
+                .WithStandardErrorPipe(PipeTarget.ToDelegate(printfn "%s"))
                 .ExecuteAsync()
                 .Task
             :> Task
