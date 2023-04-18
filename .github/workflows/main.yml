@@ -21,8 +21,7 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v3
         with:
-          dotnet-version: 7.0.x
-          dotnet-quality: 'preview'
+          dotnet-version: 7.0.400-preview.23217.10
       - name: Version
         run: dotnet --version
       - name: Run F# script
