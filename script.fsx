@@ -224,12 +224,11 @@ let initialBuild (repositoryFolder: DirectoryInfo) (project: ProjectInRepository
                 printfn $"Could build {project.Path} to extract the fsc arguments."
 
             let fscArgs = mkCompilerArgsFromBinLog binlogFile
+            let outputFlagIdx = fscArgs.IndexOf("-o:")
 
             let fscArgs =
-                fscArgs.Split([| ' '; '\n' |])
                 // Skip the dotnet.exe fsc.dll arguments.
-                |> Array.skip 2
-                |> String.concat "\n"
+                fscArgs.Substring(outputFlagIdx)
 
             File.WriteAllText(argsPath, fscArgs)
 
