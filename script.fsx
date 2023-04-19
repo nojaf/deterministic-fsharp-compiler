@@ -29,10 +29,8 @@ let getFileHash filename =
     use stream = File.OpenRead(filename)
     let hash = sha256.ComputeHash(stream)
     BitConverter.ToString(hash).Replace("-", "")
-// TODO: get SDK path
 
 Environment.SetEnvironmentVariable("SuppressNETCoreSdkPreviewMessage", "true")
-
 let DotnetFscCompilerPath = Path.Combine(AppContext.BaseDirectory, "fsc.dll")
 
 // TODO: Capture information about the state of the compiler
@@ -110,6 +108,19 @@ type RepositoryResult = RepositoryResult of repository: RepositoryConfiguration 
 
 let repositories =
     [
+        {
+            GitUrl = "https://github.com/G-Research/ApiSurface"
+            CommitSha = "0e181dbfa2792d333c013db8a70139a5cab80f2e"
+            RemoveGlobalJson = false
+            Init = [ Cli.Wrap("dotnet").WithArguments("restore") ]
+            Projects =
+                [
+                    {
+                        Path = "ApiSurface/ApiSurface.fsproj"
+                        AdditionalInitialBuildArguments = []
+                    }
+                ]
+        }
         {
             GitUrl = "https://github.com/fsprojects/fantomas"
             CommitSha = "d3f2daa02eccf6fb0fbcd1bfeeaccfd252a67700"
@@ -442,3 +453,5 @@ let allBinariesHaveTheSameHash =
 
 if not allBinariesHaveTheSameHash then
     exit 1
+else
+    printfn "All binaries have the same hash."
