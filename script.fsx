@@ -239,7 +239,11 @@ let initialBuild (repositoryFolder: DirectoryInfo) (project: ProjectInRepository
 
             let fscArgs =
                 // Skip the dotnet.exe fsc.dll arguments.
-                fscArgs.Substring(outputFlagIdx)
+                fscArgs
+                    .Substring(outputFlagIdx)
+                    // Skip the --times argument.
+                    .Replace("--times\n", "")
+                    .Replace("--times\r\n", "")
 
             File.WriteAllText(argsPath, fscArgs)
 
