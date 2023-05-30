@@ -10,9 +10,6 @@ open System.Threading.Tasks
 open CliWrap
 
 // 0. Setup and helper functions
-let isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-let sdkFolder = Path.Combine(__SOURCE_DIRECTORY__, ".sdks")
-let fsharpFolder = Path.Combine(__SOURCE_DIRECTORY__, ".fsharp")
 let repositoriesFolder = Path.Combine(__SOURCE_DIRECTORY__, ".repositories")
 
 let limits =
@@ -32,8 +29,6 @@ let getFileHash filename =
 
 Environment.SetEnvironmentVariable("SuppressNETCoreSdkPreviewMessage", "true")
 let DotnetFscCompilerPath = Path.Combine(AppContext.BaseDirectory, "fsc.dll")
-
-// TODO: Capture information about the state of the compiler
 
 // 3. Clone various projects to test
 if not (Directory.Exists repositoriesFolder) then

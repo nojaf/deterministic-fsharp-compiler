@@ -14,12 +14,8 @@ env:
 
 jobs:
   run-script:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
-      - name: Enable long paths
-        run: |
-          git config --system core.longpaths true
-          echo "export GIT_OPTIONAL_LOCKS=0" >> $GITHUB_ENV
       - name: Checkout code
         uses: actions/checkout@v3
       - name: Setup .NET
