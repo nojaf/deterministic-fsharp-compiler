@@ -60,7 +60,7 @@ type TypeCheckMode =
     member x.Flags =
         match x with
         | Sequential -> "--deterministic+"
-        | Parallel -> "--deterministic+ --test:GraphBasedChecking --test:ParallelOptimization --test:ParallelIlxGen"
+        | Parallel -> "--deterministic+ --parallelreferenceresolution --test:GraphBasedChecking --test:ParallelOptimization --test:ParallelIlxGen"
 
     override x.ToString() =
         match x with
